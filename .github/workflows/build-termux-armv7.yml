@@ -69,9 +69,25 @@ jobs:
           maturin --version
           python -c "import sys, sysconfig; print(sys.platform, sysconfig.get_platform())"
 
+          # Le Python de Termux se présente comme "android-24-armeabi_v7a" :
+          # maturin a besoin de ce niveau d'API pour étiqueter la wheel.
+          export ANDROID_API_LEVEL=$(python -c "import sysconfig; print(sysconfig.get_platform().split('-')[1])")
+          echo "ANDROID_API_LEVEL=$ANDROID_API_LEVEL"
+
+          # Téléchargement direct du sdist depuis PyPI (pip download recompilerait
+          # maturin depuis les sources, ce qui prend ~50 min sous émulation).
           SPEC="$(cat "$W/spec.txt")"
           rm -rf "$HOME/src" && mkdir -p "$HOME/src"
-          pip download --no-deps --no-binary :all: -d "$HOME/src" "$SPEC"
+          python - "$SPEC" "$HOME/src" <<'PY'
+          import json, sys, urllib.request
+          spec, dest = sys.argv[1], sys.argv[2]
+          name, _, ver = spec.partition("==")
+          url = f"https://pypi.org/pypi/{name}/{ver + '/' if ver else ''}json"
+          info = json.load(urllib.request.urlopen(url))
+          sdist = next(f for f in info["urls"] if f["packagetype"] == "sdist")
+          print("sdist :", sdist["filename"])
+          urllib.request.urlretrieve(sdist["url"], f"{dest}/{sdist['filename']}")
+          PY
           tar -xzf "$HOME"/src/*.tar.gz -C "$HOME/src"
           cd "$(ls -d "$HOME"/src/*/ | head -n 1)"
           maturin build --release --interpreter python --out "$W/wheelhouse"
