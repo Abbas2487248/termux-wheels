@@ -47,6 +47,7 @@ jobs:
           export PIP_BREAK_SYSTEM_PACKAGES=1
           export PIP_DISABLE_PIP_VERSION_CHECK=1
           W="$HOME/work"
+          PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 
           # Même dépôt Termux que sur le téléphone -> même Python 3.14
           apt-get update
@@ -90,9 +91,19 @@ jobs:
           PY
           tar -xzf "$HOME"/src/*.tar.gz -C "$HOME/src"
           cd "$(ls -d "$HOME"/src/*/ | head -n 1)"
-          maturin build --release --interpreter python --out "$W/wheelhouse"
+          # Sur Android, une extension doit être liée explicitement à libpython,
+          # sinon : "cannot locate symbol PyExc_TypeError" à l'import.
+          PYLIB=$(python -c "import sysconfig; print(sysconfig.get_config_var('LDLIBRARY'))")
+          PYLIB=${PYLIB#lib}; PYLIB=${PYLIB%.so*}
+          echo "Liaison avec -l$PYLIB"
+          maturin build --release --interpreter python --out "$W/wheelhouse" -- \
+            -C link-arg=-L"$PREFIX/lib" -C link-arg=-l"$PYLIB"
           cd "$HOME"
           ls -l "$W/wheelhouse"
+          mkdir -p "$HOME/check" && cd "$HOME/check"
+          python -m zipfile -e "$W"/wheelhouse/*.whl .
+          readelf -d $(find . -name '*.so') | grep -E 'NEEDED|RUNPATH' || true
+          cd "$HOME"
 
           # Vérifie que la wheel s'installe dans Termux ; sinon on corrige l'étiquette
           # de plateforme pour qu'elle corresponde à ce que le pip de Termux accepte.
@@ -105,8 +116,10 @@ jobs:
             pip install --no-index --find-links "$W/wheelhouse" ast-serialize
           fi
           pip show ast-serialize
-          python -c "import ast_serialize; print('import OK', ast_serialize.__file__)" \
-            || echo "AVERTISSEMENT: import ast_serialize impossible"
+          # Test bloquant : aucune wheel n'est publiée si l'import échoue
+          cd /
+          python -c "import ast_serialize; print('import OK', ast_serialize.__file__)"
+          cd "$HOME"
           ls -l "$W/wheelhouse"
           EOF
           chmod -R 777 work
