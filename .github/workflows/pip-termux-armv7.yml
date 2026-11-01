@@ -107,6 +107,9 @@ jobs:
 
       - name: Compiler dans un vrai environnement Termux arm
         run: |
+          # pipefail : un échec dans Termux (y compris le test) doit faire échouer
+          # l'étape malgré le « | tee », sinon une wheel non validée serait publiée.
+          set -o pipefail
           docker run --rm --privileged \
             -v "$PWD/work:/data/data/com.termux/files/home/work" \
             termux/termux-docker:arm \
