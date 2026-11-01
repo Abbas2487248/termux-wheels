@@ -1,0 +1,167 @@
+# Compile des paquets Python (C / Cython / setuptools) et leurs dépendances
+# en wheels pour Termux (arm 32 bits, armv7l, Python du dépôt Termux).
+# Se lance tout seul quand ce fichier change (valeurs par défaut ci-dessous),
+# ou à la main : onglet "Actions" > "Wheels pip Termux armv7" > "Run workflow".
+
+name: Wheels pip Termux armv7
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/pip-termux-armv7.yml"
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Paquets à compiler, séparés par des espaces (ex: uvloop==0.22.1 msgpack)"
+        required: true
+        default: "uvloop"
+      test:
+        description: "Code Python de test exécuté dans Termux après installation"
+        required: true
+        default: "import asyncio, uvloop; uvloop.run(asyncio.sleep(0.01)); print('uvloop OK', uvloop.__version__)"
+
+env:
+  PACKAGES: ${{ inputs.packages || 'uvloop' }}
+  TEST_CODE: ${{ inputs.test || 'import asyncio, uvloop; uvloop.run(asyncio.sleep(0.01)); print(''uvloop OK'', uvloop.__version__)' }}
+
+permissions:
+  contents: write   # pour publier les wheels dans une Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # la compilation sous émulation ARM est lente
+
+    steps:
+      - name: Activer l'émulation ARM 32 bits (QEMU)
+        run: docker run --rm --privileged aptman/qus -s -- -p arm
+
+      - name: Limiter pid_max (problème connu des conteneurs 32 bits)
+        run: sudo sysctl -w kernel.pid_max=65535
+
+      - name: Préparer le script de compilation
+        run: |
+          mkdir -p work/wheelhouse
+          printf '%s\n' "$PACKAGES" > work/packages.txt
+          printf '%s\n' "$TEST_CODE" > work/test.py
+          cat > work/build.sh <<'EOF'
+          set -eux -o pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export PIP_BREAK_SYSTEM_PACKAGES=1
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          W="$HOME/work"
+          PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+          OUT="$W/wheelhouse"
+
+          # Même dépôt Termux que sur le téléphone -> même Python 3.14
+          apt-get update
+          apt-get -y -o Dpkg::Options::=--force-confnew full-upgrade
+          apt-get -y install python python-pip clang make binutils pkg-config \
+            autoconf automake libtool libuv
+
+          uname -m
+          python --version
+          python -c "import sys, sysconfig; print(sys.platform, sysconfig.get_platform())"
+          export ANDROID_API_LEVEL=$(python -c "import sysconfig; print(sysconfig.get_platform().split('-')[1])")
+          export MAKEFLAGS="-j2"
+
+          PKGS="$(cat "$W/packages.txt")"
+
+          # 1) Essai normal : chaque paquet + ses dépendances, libs embarquées
+          #    (pour uvloop : libuv compilée et intégrée dans la wheel).
+          if ! pip wheel -v -w "$OUT" $PKGS 2>&1 | tee "$W/pip1.log"; then
+            echo "::warning::Premier essai échoué, nouvel essai avec les bibliothèques système de Termux"
+            # 2) Repli : utiliser les bibliothèques Termux (ex. libuv du paquet
+            #    "libuv"). Il faudra alors "pkg install libuv" sur le téléphone.
+            printf '[build_ext]\nuse_system_libuv = 1\n' > "$W/extra.cfg"
+            export DIST_EXTRA_CONFIG="$W/extra.cfg"
+            export LDFLAGS="-L$PREFIX/lib"
+            export CFLAGS="-I$PREFIX/include"
+            pip wheel -v -w "$OUT" $PKGS 2>&1 | tee "$W/pip2.log"
+            echo "system-libs" > "$W/mode.txt"
+          else
+            echo "bundled" > "$W/mode.txt"
+          fi
+
+          ls -l "$OUT"
+
+          # Dépendances des bibliothèques natives (doivent inclure libpython3.14)
+          mkdir -p "$HOME/check" && cd "$HOME/check"
+          for whl in "$OUT"/*.whl; do
+            case "$whl" in *-none-any.whl) continue ;; esac
+            rm -rf x && mkdir x && python -m zipfile -e "$whl" x
+            for so in $(find x -name '*.so'); do
+              echo "== $so"; readelf -d "$so" | grep -E 'NEEDED|RUNPATH' || true
+            done
+          done
+          cd "$HOME"
+
+          # Installation depuis les wheels uniquement, puis test bloquant
+          pip install --no-index --find-links "$OUT" $PKGS
+          cd /
+          python "$W/test.py"
+          cd "$HOME"
+          EOF
+          chmod -R 777 work
+
+      - name: Compiler dans un vrai environnement Termux arm
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD/work:/data/data/com.termux/files/home/work" \
+            termux/termux-docker:arm \
+            bash /data/data/com.termux/files/home/work/build.sh 2>&1 | tee build.log
+
+      - name: Résumé de l'erreur
+        if: failure()
+        run: |
+          tail -n 60 build.log > tail.log || true
+          msg=$(sed -e 's/%/%25/g' tail.log | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Echec de compilation::${msg}"
+
+      - name: Publier les wheels (artefact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-termux-armv7
+          path: work/wheelhouse/*.whl
+          if-no-files-found: error
+
+      - name: Publier les wheels compilées (Release GitHub)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          # Les wheels "none-any" (pur Python) s'installent déjà depuis PyPI :
+          # on ne publie que celles compilées pour Termux.
+          WHLS=()
+          for w in work/wheelhouse/*.whl; do
+            case "$w" in *-none-any.whl) ;; *) WHLS+=("$w") ;; esac
+          done
+          if [ ${#WHLS[@]} -eq 0 ]; then
+            echo "Aucune wheel compilée : tout est pur Python." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          FIRST=$(basename "${WHLS[0]}")
+          NAME=$(echo "$FIRST" | cut -d- -f1)
+          VER=$(echo "$FIRST" | cut -d- -f2)
+          TAG="${NAME}-${VER}-termux-armv7"
+          MODE=$(cat work/mode.txt)
+          {
+            echo "Wheels compilées dans Termux (arm, armv7l, Python 3.14)."
+            echo
+            if [ "$MODE" = "system-libs" ]; then
+              echo "⚠️ Liées aux bibliothèques de Termux : installer d'abord \`pkg install libuv\`."
+              echo
+            fi
+            echo "Installation dans Termux :"
+            echo
+            echo '```'
+            for w in "${WHLS[@]}"; do
+              echo "pip install https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$w")"
+            done
+            echo '```'
+          } > notes.md
+          gh release delete "$TAG" -y --cleanup-tag -R "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" "${WHLS[@]}" -R "$GITHUB_REPOSITORY" \
+            --title "${NAME} ${VER} — Termux armv7" --notes-file notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
