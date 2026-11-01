@@ -63,16 +63,31 @@ jobs:
           export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
           export CARGO_PROFILE_RELEASE_DEBUG=0
 
-          # maturin : paquet Termux s'il existe, sinon index TUR, sinon compilé
-          apt-get -y install maturin \
-            || pip install --extra-index-url https://termux-user-repository.github.io/pypi/ maturin
+          # Le paquet Termux "maturin" fournit la commande (pas le module Python
+          # que pip attend) : on appelle donc maturin directement sur les sources.
+          apt-get -y install maturin
           maturin --version
+          python -c "import sys, sysconfig; print(sys.platform, sysconfig.get_platform())"
 
           SPEC="$(cat "$W/spec.txt")"
-          pip wheel -v --no-deps --no-build-isolation -w "$W/wheelhouse" "$SPEC"
+          rm -rf "$HOME/src" && mkdir -p "$HOME/src"
+          pip download --no-deps --no-binary :all: -d "$HOME/src" "$SPEC"
+          tar -xzf "$HOME"/src/*.tar.gz -C "$HOME/src"
+          cd "$(ls -d "$HOME"/src/*/ | head -n 1)"
+          maturin build --release --interpreter python --out "$W/wheelhouse"
+          cd "$HOME"
+          ls -l "$W/wheelhouse"
 
-          # Vérifie que la wheel s'installe et s'importe bien dans Termux
-          pip install --no-index --find-links "$W/wheelhouse" ast-serialize
+          # Vérifie que la wheel s'installe dans Termux ; sinon on corrige l'étiquette
+          # de plateforme pour qu'elle corresponde à ce que le pip de Termux accepte.
+          if ! pip install --no-index --find-links "$W/wheelhouse" ast-serialize; then
+            PLAT=$(python -c "import sysconfig; print(sysconfig.get_platform().replace('-', '_').replace('.', '_'))")
+            echo "Ré-étiquetage de la wheel pour la plateforme $PLAT"
+            pip install wheel
+            python -m wheel tags --remove --platform-tag "$PLAT" "$W"/wheelhouse/*.whl
+            ls -l "$W/wheelhouse"
+            pip install --no-index --find-links "$W/wheelhouse" ast-serialize
+          fi
           pip show ast-serialize
           python -c "import ast_serialize; print('import OK', ast_serialize.__file__)" \
             || echo "AVERTISSEMENT: import ast_serialize impossible"
