@@ -1,0 +1,178 @@
+# Compile des paquets Python écrits en Rust (maturin / PyO3) et leurs
+# dépendances en wheels pour Termux (arm 32 bits, armv7l, Python du dépôt Termux).
+# À lancer à la main : onglet "Actions" > "Wheels Rust Termux armv7" > "Run workflow".
+
+name: Wheels Rust Termux armv7
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Paquets Rust à compiler, séparés par des espaces (ex: watchfiles ast-serialize==0.13.1)"
+        required: true
+        default: "ast-serialize"
+      test:
+        description: "Code Python de test exécuté dans Termux après installation"
+        required: true
+        default: "import ast_serialize; print('ast_serialize OK')"
+
+env:
+  PACKAGES: ${{ inputs.packages }}
+  TEST_CODE: ${{ inputs.test }}
+
+permissions:
+  contents: write   # pour publier les wheels dans une Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # la compilation Rust sous émulation ARM est lente
+
+    steps:
+      - name: Activer l'émulation ARM 32 bits (QEMU)
+        run: docker run --rm --privileged aptman/qus -s -- -p arm
+
+      - name: Limiter pid_max (problème connu des conteneurs 32 bits)
+        run: sudo sysctl -w kernel.pid_max=65535
+
+      - name: Préparer le script de compilation
+        run: |
+          mkdir -p work/wheelhouse
+          printf '%s\n' "$PACKAGES" > work/packages.txt
+          printf '%s\n' "$TEST_CODE" > work/test.py
+          cat > work/build.sh <<'EOF'
+          set -eux -o pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export PIP_BREAK_SYSTEM_PACKAGES=1
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          W="$HOME/work"
+          PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+          OUT="$W/wheelhouse"
+
+          # Même dépôt Termux que sur le téléphone -> même Python 3.14
+          apt-get update
+          apt-get -y -o Dpkg::Options::=--force-confnew full-upgrade
+          apt-get -y install python python-pip rust maturin binutils clang make pkg-config
+
+          uname -m
+          python --version
+          rustc --version
+          maturin --version
+          python -c "import sys, sysconfig; print(sys.platform, sysconfig.get_platform())"
+
+          # maturin a besoin du niveau d'API Android du Python de Termux
+          export ANDROID_API_LEVEL=$(python -c "import sysconfig; print(sysconfig.get_platform().split('-')[1])")
+
+          # Moins de mémoire et de temps pour rustc (adressage 32 bits sous QEMU)
+          export CARGO_BUILD_JOBS=2
+          export CARGO_PROFILE_RELEASE_LTO=false
+          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+          export CARGO_PROFILE_RELEASE_DEBUG=0
+
+          # Sur Android, une extension doit être liée explicitement à libpython,
+          # sinon : "cannot locate symbol PyExc_TypeError" à l'import.
+          PYLIB=$(python -c "import sysconfig; print(sysconfig.get_config_var('LDLIBRARY'))")
+          PYLIB=${PYLIB#lib}; PYLIB=${PYLIB%.so*}
+
+          PKGS="$(cat "$W/packages.txt")"
+
+          # 1) Chaque paquet Rust : sdist téléchargé directement depuis PyPI
+          #    (pip recompilerait maturin depuis les sources), puis maturin build.
+          for SPEC in $PKGS; do
+            rm -rf "$HOME/src" && mkdir -p "$HOME/src"
+            python - "$SPEC" "$HOME/src" <<'PY'
+          import json, sys, urllib.request
+          spec, dest = sys.argv[1], sys.argv[2]
+          name, _, ver = spec.partition("==")
+          url = f"https://pypi.org/pypi/{name}/{ver + '/' if ver else ''}json"
+          info = json.load(urllib.request.urlopen(url))
+          sdist = next(f for f in info["urls"] if f["packagetype"] == "sdist")
+          print("sdist :", sdist["filename"])
+          urllib.request.urlretrieve(sdist["url"], f"{dest}/{sdist['filename']}")
+          PY
+            tar -xzf "$HOME"/src/*.tar.gz -C "$HOME/src"
+            cd "$(ls -d "$HOME"/src/*/ | head -n 1)"
+            maturin build --release --interpreter python --out "$OUT" -- \
+              -C link-arg=-L"$PREFIX/lib" -C link-arg=-l"$PYLIB"
+            cd "$HOME"
+          done
+
+          # 2) Dépendances : téléchargées, ou compilées si elles n'ont pas de
+          #    wheel compatible (les wheels Rust ci-dessus sont réutilisées).
+          pip wheel --prefer-binary --find-links "$OUT" -w "$OUT" $PKGS
+          ls -l "$OUT"
+
+          # Dépendances des bibliothèques natives (doivent inclure libpython3.14)
+          mkdir -p "$HOME/check" && cd "$HOME/check"
+          for whl in "$OUT"/*.whl; do
+            case "$whl" in *-none-any.whl) continue ;; esac
+            rm -rf x && mkdir x && python -m zipfile -e "$whl" x
+            for so in $(find x -name '*.so'); do
+              echo "== $so"; readelf -d "$so" | grep -E 'NEEDED|RUNPATH' || true
+            done
+          done
+          cd "$HOME"
+
+          # Installation depuis les wheels uniquement, puis test bloquant
+          pip install --no-index --find-links "$OUT" $PKGS
+          cd /
+          python "$W/test.py"
+          cd "$HOME"
+          EOF
+          chmod -R 777 work
+
+      - name: Compiler dans un vrai environnement Termux arm
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD/work:/data/data/com.termux/files/home/work" \
+            termux/termux-docker:arm \
+            bash /data/data/com.termux/files/home/work/build.sh 2>&1 | tee build.log
+
+      - name: Résumé de l'erreur
+        if: failure()
+        run: |
+          tail -n 60 build.log > tail.log || true
+          msg=$(sed -e 's/%/%25/g' tail.log | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Echec de compilation::${msg}"
+
+      - name: Publier les wheels (artefact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-rust-termux-armv7
+          path: work/wheelhouse/*.whl
+          if-no-files-found: error
+
+      - name: Publier les wheels compilées (Release GitHub)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          # Les wheels "none-any" (pur Python) s'installent déjà depuis PyPI :
+          # on ne publie que celles compilées pour Termux.
+          WHLS=()
+          for w in work/wheelhouse/*.whl; do
+            case "$w" in *-none-any.whl) ;; *) WHLS+=("$w") ;; esac
+          done
+          if [ ${#WHLS[@]} -eq 0 ]; then
+            echo "Aucune wheel compilée : tout est pur Python." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          FIRST=$(basename "${WHLS[0]}")
+          NAME=$(echo "$FIRST" | cut -d- -f1 | tr '_' '-')
+          VER=$(echo "$FIRST" | cut -d- -f2)
+          TAG="${NAME}-${VER}-termux-armv7"
+          {
+            echo "Wheels compilées dans Termux (arm, armv7l, Python 3.14)."
+            echo
+            echo "Installation dans Termux :"
+            echo
+            echo '```'
+            for w in "${WHLS[@]}"; do
+              echo "pip install https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$w")"
+            done
+            echo '```'
+          } > notes.md
+          gh release delete "$TAG" -y --cleanup-tag -R "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" "${WHLS[@]}" -R "$GITHUB_REPOSITORY" \
+            --title "${NAME} ${VER} — Termux armv7" --notes-file notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
